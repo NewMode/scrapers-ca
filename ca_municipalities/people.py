@@ -1,246 +1,273 @@
-from utils import csv_reader
+from utils import CanadianScraper, CanadianPerson as Person
+from opencivicdata.divisions import Division
+from pupa.scrape import Organization
+import re
+from utils import CSVScraper
+import requests
+from collections import defaultdict
+import os
+from io import BytesIO, StringIO
+import agate
+import agateexcel 
+import csv
+import sys
+import json
+import urllib.request
 
-class MunicipalCSVScraper(CanadianScraper):
-    # File flags
-    """
-    Set the CSV file's delimiter.
-    """
-    delimiter = ','
-    """
-    Set the CSV file's encoding, like 'windows-1252' ('utf-8' by default).
-    """
-    encoding = None
-    """
-    If `csv_url` is a ZIP file, set the compressed file to read.
-    """
-    filename = None
 
-    # Table flags
-    """
-    If the CSV table starts with non-data rows, set the number of rows to skip.
-    """
-    skip_rows = 0
-
-    # Row flags
-    """
-    A dictionary of column names to dictionaries of actual to corrected values.
-    """
-    corrections = {}
-    """
-    Set whether the jurisdiction has multiple members per division, in which
-    case a seat number is appended to the district.
-    """
-    many_posts_per_area = False
-    """
-    If `many_posts_per_area` is set, set the roles without seat numbers.
-    """
-    unique_roles = ('Mayor', 'Deputy Mayor', 'Regional Chair')
-    """
-    A format string to generate the district name. Rarely used.
-    """
-    district_name_format_string = None
-    """
-    A dictionary of column names to alternate column names. Rarely used.
-    """
-    fallbacks = {}
-    """
-    A dictionary of people's names to lists of alternate names. Rarely used.
-    """
-    other_names = {}
-    """
-    The classification of the organization.
-    """
-    organization_classification = None
-
-    """
-    Set the `locale` of the data, like 'fr'.
-    """
-    column_headers = {
-        'fr': {
-            'nom du district': 'district name',
-            'identifiant du district': 'district id',
-            'rôle': 'primary role',
-            'prénom': 'first name',
-            'nom': 'last name',
-            'genre': 'gender',
-            'nom du parti': 'party name',
-            'courriel': 'email',
-            "url d'une photo": 'photo url',
-            'url source': 'source url',
-            'site web': 'website',
-            'adresse ligne 1': 'address line 1',
-            'adresse ligne 2': 'address line 2',
-            'localité': 'locality',
-            'province': 'province',
-            'code postal': 'postal code',
-            'téléphone': 'phone',
-            'télécopieur': 'fax',
-            'cellulaire': 'cell',
-            'facebook': 'facebook',
-            'twitter': 'twitter',
-            'date de naissance': 'birth date',
-        },
-    }
-
-    """
-    Normalizes a column header name. By default, lowercases it and replaces
-    underscores with spaces (e.g. because Esri fields can't contain spaces).
-    """
-    def header_converter(self, s):
-        header = s.lower().replace('_', ' ')
-        if hasattr(self, 'locale'):
-            return self.column_headers[self.locale].get(header, header)
-        else:
-            return header
-
-    """
-    Returns whether the row should be imported. By default, skips empty rows
-    and rows in which a name component is "Vacant".
-    """
-    def is_valid_row(self, row):
-        empty = ('', 'Vacant')
-        if not any(row.values()):
-            return False
-        if 'first name' in row and 'last name' in row:
-            return row['last name'] not in empty and row['first name'] not in empty
-        return row['name'] not in empty
-
+class CanadaMunicipalitiesPersonScraper(CSVScraper):
+    csv_url = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vRrGXQy8qk16OhuTjlccoGB4jL5e8X1CEqRbg896ufLdh67DQk9nuGm-oufIT0HRMPEnwePw2HDx1Vj/pub?output=csv'
+    encoding = 'utf-8'
+    locale = 'fr'
+    corrections = {
+        'district name': lambda value: value.capitalize(),
+    } 
+  
     def scrape(self):
+        infixes = {
+        'CY': 'City',
+        'DM': 'District',
+        'IGD': 'District',
+        'IM': 'Municipal',
+        'RGM': 'Regional',
+        'T': 'Town',
+        'VL': 'Village',
+        'RDA': 'District',
+        }
+        exclude_districts = {}
+        processed_ids = set()
+        exclude_divisions = {}
+        processed_divisions = set()
+        print("scrape---------")
         seat_numbers = defaultdict(lambda: defaultdict(int))
+        data = None
 
-        extension = os.path.splitext(self.csv_url)[1]
-        if extension in ('.xls', '.xlsx'):
-            data = StringIO()
-            binary = BytesIO(self.get(self.csv_url).content)
-            if extension == '.xls':
-                table = agate.Table.from_xls(binary)
-            elif extension == '.xlsx':
-                table = agate.Table.from_xlsx(binary)
-            table.to_csv(data)
-            data.seek(0)
-        elif extension == '.zip':
-            basename = os.path.basename(self.csv_url)
-            if not self.encoding:
-                self.encoding = 'utf-8'
-            try:
-                response = requests.get(self.csv_url, stream=True)
-                with open(basename, 'wb') as f:
-                    for chunk in response.iter_content():
-                        f.write(chunk)
-                with ZipFile(basename).open(self.filename, 'r') as fp:
-                    data = StringIO(fp.read().decode(self.encoding))
-            finally:
-                os.unlink(basename)
-        else:
-            data = None
+        organizations = {}
+        names_to_ids = {}
 
+        processed_ids = set()
+        exclude_divisions = {}
+        processed_divisions = set()
+        
+        for division in Division.get('ocd-division/country:ca').children('csd'):
+            type_id = division.id.rsplit(':', 1)[1]
+            if type_id.startswith('59'):
+                if division.attrs['classification'] == 'IRI':
+                    continue
+                if division.name in names_to_ids:
+                    names_to_ids[division.name] = None
+                else:
+                    names_to_ids[division.name] = division.id
+          
+        print("reader---------")
         reader = self.csv_reader(self.csv_url, delimiter=self.delimiter, header=True, encoding=self.encoding, skip_rows=self.skip_rows, data=data)
         reader.fieldnames = [self.header_converter(field) for field in reader.fieldnames]
         for row in reader:
-            # ca_qc_laval: "maire et president du comite executif", "conseiller et membre du comite executif"
-            # ca_qc_montreal: "Conseiller de la ville; Membre…", "Maire d'arrondissement\nMembre…"
-            if row.get('primary role'):
-                row['primary role'] = re.split(r'(?: (?:et)\b|[;\n])', row['primary role'], 1)[0].strip()
+            if row.get('district name'):
+                municipalities = row['district name']
+                print("1........................")
+                print(municipalities)
+       
 
-            if self.is_valid_row(row):
-                for key, corrections in self.corrections.items():
-                    if not isinstance(corrections, dict):
-                        row[key] = corrections(row[key])
-                    elif row[key] in corrections:
-                        row[key] = corrections[row[key]]
+            for municipality in municipalities:
+                if row.get('district id'):
+                    division_id = row['district id']
+                    print("2.........")
+                    print(division_id)
+                if row.get('district name'):
+                    division_name = row['district name']
+                    print("3.........")
+                    print(division_name)
 
-                # ca_qc_montreal
-                if row.get('last name') and not re.search(r'[a-z]', row['last name']):
-                    row['last name'] = re.sub(r'(?<=\b[A-Z])[A-ZÀÈÉ]+\b', lambda x: x.group(0).lower(), row['last name'])
-
-                if row.get('first name') and row.get('last name'):
-                    name = '{} {}'.format(row['first name'], row['last name'])
-                else:
-                    name = row['name']
-
-                province = row.get('province')
-                role = row['primary role']
-
-                # ca_qc_laval: "maire …", "conseiller …"
-                if role not in ('candidate', 'member') and not re.search(r'[A-Z]', role):
-                    role = role.capitalize()
-
-                if self.district_name_format_string:
-                    if row['district id']:
-                        district = self.district_name_format_string.format(**row)
-                    else:
-                        district = self.jurisdiction.division_name
-                elif row.get('district name'):
-                    district = row['district name']
-                elif self.fallbacks.get('district name'):
-                    district = row[self.fallbacks['district name']] or self.jurisdiction.division_name
-                else:
-                    district = self.jurisdiction.division_name
-
-                district = district.replace('–', '—')  # n-dash, m-dash
-
-                # ca_qc_montreal
-                if district == 'Ville-Marie' and role == 'Maire de la Ville de Montréal':
-                    district = self.jurisdiction.division_name
-
-                if self.many_posts_per_area and role not in self.unique_roles:
-                    seat_numbers[role][district] += 1
-                    district = '{} (seat {})'.format(district, seat_numbers[role][district])
-
-                lines = []
-                if row.get('address line 1'):
-                    lines.append(row['address line 1'])
-                if row.get('address line 2'):
-                    lines.append(row['address line 2'])
-                if row.get('locality'):
-                    parts = [row['locality']]
-                    if province:
-                        parts.append(province)
-                    if row.get('postal code'):
-                        parts.extend(['', row['postal code']])
-                    lines.append(' '.join(parts))
-
-                organization_classification = self.organization_classification or self.jurisdiction.classification
-                p = CanadianPerson(primary_org=organization_classification, name=name, district=district, role=role, party=row.get('party name'))
-                p.add_source(self.csv_url)
-
-                if not row.get('district name') and row.get('district id'):  # ca_on_toronto_candidates
-                    if len(row['district id']) == 7:
-                        p._related[0].extras['boundary_url'] = '/boundaries/census-subdivisions/{}/'.format(row['district id'])
-
-                if row.get('gender'):
-                    p.gender = row['gender']
-                if row.get('photo url'):
-                    p.image = row['photo url']
+                if row.get('primary role'):
+                    leader_reps=row['primary role']   
+                    print("4............")
+                    print(leader_reps)
+                    
+                # organization_name = '{} {} Council'.format(division_name, infixes[division.attrs['classification']])
+                if row.get('organization'):
+                    organization_name = row['organization']
+                    print("5...........")
+                    print(organization_name)
 
                 if row.get('source url'):
-                    p.add_source(row['source url'])
+                    record_url=row['source url']   
+                    print("6............")
+                    print(record_url)
+                print("11111111111111111111111111")
+                print(division_id)
 
-                if row.get('website'):
-                    p.add_link(row['website'], note='web site')
-                if row.get('facebook'):
-                    p.add_link(re.sub(r'[#?].+', '', row['facebook']))
-                if row.get('twitter'):
-                    p.add_link(row['twitter'])
+                division = Division.get('ocd-division/country:ca/csd:1308007')
 
-                if row['email']:
-                    p.add_contact('email', row['email'].strip().split('\n')[-1])  # ca_qc_montreal
-                if lines:
-                    p.add_contact('address', '\n'.join(lines), 'legislature')
-                if row.get('phone'):
-                    p.add_contact('voice', row['phone'].split(';', 1)[0], 'legislature')  # ca_qc_montreal, ca_on_huron
-                if row.get('fax'):
-                    p.add_contact('fax', row['fax'], 'legislature')
-                if row.get('cell'):
-                    p.add_contact('cell', row['cell'], 'legislature')
-                if row.get('birth date'):
-                    p.birth_date = row['birth date']
+                if division_id not in processed_ids:
+                    processed_ids.add(division_id)
+                    organizations[division_id] = Organization(name=organization_name, classification='government')
+                    organizations[division_id].add_source(record_url)
+                organization = organizations[division_id]
+                organization.add_post(role='Mayor', label=division_name, division_id=division_id)
+                organization.add_post(role='Councillor', label=division_name, division_id=division_id)
 
-                if row.get('incumbent'):
-                    p.extras['incumbent'] = row['incumbent']
+       
+            if municipal_id and municipal_id.strip():
+                # Get division ID from municipal name and filter out duplicates or unknowns.
+                if division_name in exclude_districts or division_name in processed_divisions:
+                    continue
+                division_id = names_to_ids[division_name]
+                if not isinstance(division_id, str):
+                    continue
+                if division_id in exclude_divisions:
+                    continue
+                if division_id in processed_ids:
+                    raise Exception('unhandled collision: {}'.format(division_id))
+                division = Division.get(division_id)
+                processed_divisions.add(division_name)
 
-                if name in self.other_names:
-                    for other_name in self.other_names[name]:
-                        p.add_name(other_name)
+                # Create person records for all mayor and councillor representatives.
+                for leader_rep in leader_reps:
+                    yield self.person_data(leader_rep, division_id, division_name, 'Mayor', organization_name)
+                for councillor_rep in councillor_reps:
+                    yield self.person_data(councillor_rep, division_id, division_name, 'Councillor', organization_name)
 
-                yield p
+        # Iterate through each organization.
+            for organization in organizations.values():
+                yield organization
+
+
+
+        def person_data(self, representative, division_id, division_name, role, organization_name):
+       
+
+            #p = Person(primary_org='government', primary_org_name=organization_name, name=representative_name, district=division_name, role=role)
+            if row.get('full name'):
+                representative_name = row['full name']
+
+            p = Person(primary_org='government', primary_org_name=organization_name, name=representative_name, district=division_name, role=role)
+
+            p.add_source(self.csv_url)
+
+            if not row.get('district name') and row.get('district id'):  # ca_on_toronto_candidates
+                if len(row['district id']) == 7:
+                    p._related[0].extras['boundary_url'] = '/boundaries/census-subdivisions/{}/'.format(row['district id'])
+
+          # p._related[0].extras['boundary_url'] = '/boundaries/census-subdivisions/{}/'.format(division_id.rsplit(':', 1)[1])
+            if row.get('gender'):
+                p.gender = row['gender']
+            if row.get('photo url'):
+                p.image = row['photo url']
+
+            if row.get('source url'):
+                p.add_source(row['source url'])
+
+            if row.get('website'):
+                p.add_link(row['website'], note='web site')
+            if row.get('facebook'):
+                p.add_link(re.sub(r'[#?].+', '', row['facebook']))
+            if row.get('twitter'):
+                p.add_link(row['twitter'])
+
+            if row['email']:
+                p.add_contact('email', row['email'].strip().split('\n')[-1])
+            if lines:
+                p.add_contact('address', '\n'.join(lines), 'legislature')
+            if row.get('representative_phone'):
+                p.add_contact('voice', row['phone'].split(';', 1)[0], 'legislature')  
+            if row.get('fax'):
+                p.add_contact('fax', row['fax'], 'legislature')
+            if row.get('cell'):
+                p.add_contact('cell', row['cell'], 'legislature')
+            if row.get('birth date'):
+                p.birth_date = row['birth date']
+
+            if row.get('incumbent'):
+                p.extras['incumbent'] = row['incumbent']
+
+            # if name in self.other_names:
+            #     for other_name in self.other_names[name]:
+            #         p.add_name(other_name)
+
+            return p
+
+
+        # # data_list = list()
+    #     division_name=[]
+    #     division_id=[]
+    #     organizations=[]
+    #     role=[]
+    #     representative_name=[]
+    #     representative_phone=[]
+    #     representative_email=[]
+    #     for row in reader:
+    #         municipalities = row.get('district name')
+    #         assert len(municipalities), 'No municipalities found'
+
+
+    #         division_name.append(row['district name'])
+
+    #         district_id=row.get('district id')
+    #         division_id.append(row['district id'])
+            
+    #         organization=row.get('organization')
+    #         organizations.append(row['organization'])
+
+    #         primary_role=row.get('primary role')
+    #         role.append(row['primary role'])
+
+        
+    #         # Get name.
+    #         name=row.get('full name')
+    #         representative_name.append(row['full name'])
+
+    #         # Get phone.
+    #         phone = row.get('phone')
+    #         representative_phone.append(row['phone'])
+
+    #         # Get email.
+    #         email = row.get('email')
+    #         representative_email.append(row['email'])
+
+
+    #     # for municipality in range(len(division_name)): 
+    #     #     print (division_name[municipality])
+
+
+    #     # for district in range(len(division_id)): 
+    #     #     print (division_id[district])
+
+
+    #     # for x in range(len(organizations)): 
+    #     #     print (organizations[x])
+
+
+    #     # for rep in range(len(role)): 
+    #     #     print (role[rep])
+
+
+    #     for leader_rep in role:
+    #         yield self.person_data(leader_rep, division_id, division_name, 'Mayor', organizations)
+
+
+    # # Iterate through each organization.
+    #     for organization in organizations:
+    #         yield organization
+
+
+    # def person_data(self,representative_name, division_id, division_name, role, organizations):
+
+
+    #     p = Person(primary_org='government', primary_org_name=organizations, name=representative_name, district=division_name, role=role)
+    #     p.add_source(self.csv_url)
+    #     #p._related[0].extras['boundary_url'] = url
+        
+        
+    #     url_test = '/boundaries/census-subdivisions/%s'
+    #     for i in division_id:
+    #         url = url_test %i
+    #         print(url)
+
+    #     p._related[0].extras['boundary_url'] = url
+    #     return p
+
+
+
+
+        
